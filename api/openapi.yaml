@@ -1,0 +1,8 @@
+# Placeholder — replace with the real Printify OpenAPI definition.
+# SDK resources (domain entities, ports, services, adapters) are generated/derived
+# from this spec. See .agents/architecture.md for the workflow.
+openapi: 3.0.3
+info:
+  title: Printify API
+  version: 1.0.0
+paths: {}

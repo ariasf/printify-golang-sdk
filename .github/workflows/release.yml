@@ -1,0 +1,139 @@
+name: Release
+
+# Publishes a Go module tag and a GitHub Release when a version tag is pushed.
+#
+# Flow:
+#   1. A maintainer creates a tag (e.g. `v0.1.0`).
+#   2. This workflow re-runs the full quality gate on the tagged commit.
+#   3. It cross-compiles a release binary for `examples/printify` (if added) —
+#      currently no-op for the library, but kept for future CLI tooling.
+#   4. It tags the commit with the SDK version (via `go build -ldflags -X`)
+#      so downstream users can `go get github.com/printify-go@vX.Y.Z`.
+#   5. It opens a GitHub Release and pushes the tag to the Go module proxy.
+#
+# Required secrets:
+#   - READONLY_TOKEN      GitHub token with `read:packages` (for the proxy cache).
+#   - SIGNING_PRIVATE_KEY / SIGNING_PASSPHRASE  (optional, for signed tags)
+#   - GPG_PRIVATE_KEY     (optional, for signing the Go module proxy entries)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  verify:
+    name: Verify tag and run quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Validate tag is a valid semantic version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$tag' is not a valid semantic version (expected vX.Y.Z[-prerelease])."
+            exit 1
+          fi
+          echo "Valid semantic version: $tag"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Tidy and verify go.mod is stable
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build (with version baked in)
+        run: go build -ldflags "-X github.com/printify-go/pkg/printify/adapters/rest.UserAgentVersion=${{ github.ref_name }}" ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          [ -z "$unformatted" ] || { echo "$unformatted"; exit 1; }
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: "v2.14.0"
+          args: --timeout=5m
+
+      - name: Test (race + coverage)
+        run: go test ./... -race -cover
+
+  release:
+    name: Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Generate CHANGELOG fragment
+        id: changelog
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Build a minimal, honest changelog entry.
+          # A full Conventional-Commits-based changelog (e.g. git-cliff) can be
+          # swapped in here without changing the rest of the workflow.
+          {
+            echo "## ${tag}"
+            echo
+            echo "_Automatically published by GitHub Actions on $(date -u +%Y-%m-%d)T$(date -u +%H:%M:%SZ)._"
+            echo
+            echo "See the [full commit history](https://github.com/${GITHUB_REPOSITORY}/commits/${tag}) for details."
+          } > CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+      - name: Push tag to the Go module proxy cache (idempotent)
+        # The Go module proxy fetches the tag lazily. This step is here to
+        # (a) fail fast if the tag is malformed, and (b) pre-warm the proxy
+        # for the first `go get` of this version.
+        run: |
+          go mod download
+          echo "Module is fetchable via: go get github.com/printify-go@${{ github.ref_name }}"

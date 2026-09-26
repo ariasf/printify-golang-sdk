@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+*.exe
+
+# Test / coverage artifacts
+coverage.out
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# OS cruft
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
